@@ -1,7 +1,7 @@
 {
-  "name": "gid-mcp",
+  "name": "@gid/mcp-server",
   "version": "1.0.0",
-  "description": "GID MCP Server - Model Context Protocol server for Graph-Indexed Development (Free Version)",
+  "description": "GID MCP Server - Model Context Protocol server for Graph-Indexed Development",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -20,23 +20,10 @@
     "dependency-graph",
     "architecture",
     "ai-assistant",
-    "gid",
-    "claude",
-    "anthropic"
+    "gid"
   ],
   "author": "Toni Tang",
   "license": "AGPL-3.0-or-later",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/tonioyeme/graph-indexed-development-mcp.git"
-  },
-  "homepage": "https://github.com/tonioyeme/graph-indexed-development-mcp#readme",
-  "bugs": {
-    "url": "https://github.com/tonioyeme/graph-indexed-development-mcp/issues"
-  },
-  "files": [
-    "dist"
-  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "js-yaml": "^4.1.0",

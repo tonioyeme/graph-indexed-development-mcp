@@ -1,8 +1,21 @@
 /**
  * GID Schema Validation using Zod
+ *
+ * Supports dynamic relation types:
+ * - Code-level relations: preset (implements, depends_on, calls, etc.)
+ * - Semantic-level relations: dynamic, discovered from documents
  */
 
 import { z } from 'zod';
+import { CODE_RELATIONS, SEMANTIC_RELATIONS_PRESET } from './types.js';
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Preset Relations (for suggestions and defaults)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export const PRESET_CODE_RELATIONS = [...CODE_RELATIONS];
+export const PRESET_SEMANTIC_RELATIONS = [...SEMANTIC_RELATIONS_PRESET];
+export const ALL_PRESET_RELATIONS = [...PRESET_CODE_RELATIONS, ...PRESET_SEMANTIC_RELATIONS];
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Node Schema
@@ -36,19 +49,11 @@ export const NodeSchema = z
   .passthrough();
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Edge Schema
+// Edge Schema - Dynamic Relations
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const EdgeRelationSchema = z.enum([
-  'implements',
-  'depends_on',
-  'calls',
-  'reads',
-  'writes',
-  'tested_by',
-  'defined_in',
-  'decided_by',
-]);
+// Relation is now any non-empty string (validated against meta.schema dynamically)
+const EdgeRelationSchema = z.string().min(1, 'Relation cannot be empty');
 
 export const EdgeSchema = z
   .object({
@@ -60,6 +65,33 @@ export const EdgeSchema = z
     description: z.string().optional(),
   })
   .passthrough();
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Meta Schema - Dynamic Relation Registry
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const DiscoveredRelationSchema = z.object({
+  relation: z.string().min(1),
+  category: z.enum(['code', 'semantic']),
+  source: z.string().optional(),
+  pattern: z.string().optional(),
+  added_by: z.enum(['gid_extract', 'gid_design', 'gid_complete', 'user_request']).optional(),
+  description: z.string().optional(),
+});
+
+const MetaSchemaSchema = z.object({
+  relations: z.object({
+    code: z.array(z.string()).optional(),
+    semantic: z.array(z.string()).optional(),
+  }).optional(),
+  discovered: z.array(DiscoveredRelationSchema).optional(),
+});
+
+const GraphMetaSchema = z.object({
+  version: z.string().optional(),
+  domain: z.string().optional(),
+  schema: MetaSchemaSchema.optional(),
+}).passthrough();
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Integrity Rule Schema
@@ -78,10 +110,75 @@ const IntegrityRuleSchema = z.object({
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export const GraphSchema = z.object({
+  meta: GraphMetaSchema.optional(),
   nodes: z.record(z.string(), NodeSchema),
   edges: z.array(EdgeSchema),
   integrity_rules: z.array(IntegrityRuleSchema).optional(),
 });
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Dynamic Relation Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Get all valid relations for a graph (preset + custom from meta.schema)
+ */
+export function getValidRelations(graphData?: z.infer<typeof GraphSchema>): {
+  code: string[];
+  semantic: string[];
+  all: string[];
+} {
+  const code = [...PRESET_CODE_RELATIONS];
+  const semantic = [...PRESET_SEMANTIC_RELATIONS];
+
+  // Add custom relations from meta.schema if present
+  if (graphData?.meta?.schema?.relations) {
+    const customCode = graphData.meta.schema.relations.code ?? [];
+    const customSemantic = graphData.meta.schema.relations.semantic ?? [];
+
+    for (const r of customCode) {
+      if (!code.includes(r)) code.push(r);
+    }
+    for (const r of customSemantic) {
+      if (!semantic.includes(r)) semantic.push(r);
+    }
+  }
+
+  // Also include discovered relations
+  if (graphData?.meta?.schema?.discovered) {
+    for (const d of graphData.meta.schema.discovered) {
+      if (d.category === 'code' && !code.includes(d.relation)) {
+        code.push(d.relation);
+      } else if (d.category === 'semantic' && !semantic.includes(d.relation)) {
+        semantic.push(d.relation);
+      }
+    }
+  }
+
+  return {
+    code,
+    semantic,
+    all: [...code, ...semantic],
+  };
+}
+
+/**
+ * Check if a relation is valid for the given graph
+ */
+export function isValidRelation(relation: string, graphData?: z.infer<typeof GraphSchema>): boolean {
+  const { all } = getValidRelations(graphData);
+  return all.includes(relation);
+}
+
+/**
+ * Categorize a relation as code or semantic
+ */
+export function getRelationCategory(relation: string, graphData?: z.infer<typeof GraphSchema>): 'code' | 'semantic' | 'unknown' {
+  const { code, semantic } = getValidRelations(graphData);
+  if (code.includes(relation)) return 'code';
+  if (semantic.includes(relation)) return 'semantic';
+  return 'unknown';
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Validation Result Types
@@ -122,8 +219,10 @@ export function validateSchema(data: unknown): SchemaValidationResult {
 export function validateSemantics(data: z.infer<typeof GraphSchema>): SchemaValidationResult {
   const errors: SchemaValidationError[] = [];
   const nodeIds = new Set(Object.keys(data.nodes));
+  const validRelations = getValidRelations(data);
 
   for (const [index, edge] of data.edges.entries()) {
+    // Validate node references
     if (!nodeIds.has(edge.from)) {
       errors.push({
         path: `edges[${index}].from`,
@@ -138,12 +237,46 @@ export function validateSemantics(data: z.infer<typeof GraphSchema>): SchemaVali
         suggestion: findSimilarNode(edge.to, nodeIds),
       });
     }
+
+    // Validate relation (warning for unknown, not error - allows discovery)
+    if (!validRelations.all.includes(edge.relation)) {
+      // Check for similar relations (typo detection)
+      const similarRelation = findSimilarRelation(edge.relation, validRelations.all);
+      errors.push({
+        path: `edges[${index}].relation`,
+        message: `Unknown relation "${edge.relation}" - consider adding to meta.schema.relations`,
+        suggestion: similarRelation
+          ? `Did you mean "${similarRelation}"? Or add to meta.schema.relations.semantic`
+          : `Add "${edge.relation}" to meta.schema.relations.semantic to register it`,
+      });
+    }
   }
 
   return {
-    valid: errors.length === 0,
+    valid: errors.filter(e => !e.path.includes('.relation')).length === 0, // Relations are warnings, not errors
     errors,
   };
+}
+
+/**
+ * Find similar relation name (typo detection)
+ */
+function findSimilarRelation(target: string, relations: string[]): string | undefined {
+  const targetLower = target.toLowerCase();
+
+  for (const rel of relations) {
+    const relLower = rel.toLowerCase();
+    // Check substring match
+    if (relLower.includes(targetLower) || targetLower.includes(relLower)) {
+      return rel;
+    }
+    // Check Levenshtein distance
+    if (levenshteinDistance(targetLower, relLower) <= 2) {
+      return rel;
+    }
+  }
+
+  return undefined;
 }
 
 export function validateGraph(data: unknown): SchemaValidationResult {

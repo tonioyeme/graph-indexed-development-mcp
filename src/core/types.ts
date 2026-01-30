@@ -35,15 +35,35 @@ export interface Node {
 // Edge Types
 // ═══════════════════════════════════════════════════════════════════════════════
 
-export type EdgeRelation =
-  | 'implements'
-  | 'depends_on'
-  | 'calls'
-  | 'reads'
-  | 'writes'
-  | 'tested_by'
-  | 'defined_in'
-  | 'decided_by';
+// Preset code-level relations (structural, from AST)
+export const CODE_RELATIONS = [
+  'implements',
+  'depends_on',
+  'calls',
+  'reads',
+  'writes',
+  'tested_by',
+  'defined_in',
+] as const;
+
+// Preset semantic-level relations (common patterns)
+export const SEMANTIC_RELATIONS_PRESET = [
+  'enables',
+  'blocks',
+  'requires',
+  'precedes',
+  'refines',
+  'validates',
+  'related_to',
+  'decided_by',
+] as const;
+
+// EdgeRelation is now string to allow dynamic relations
+export type EdgeRelation = string;
+
+// Type guard for preset relations
+export type PresetCodeRelation = (typeof CODE_RELATIONS)[number];
+export type PresetSemanticRelation = (typeof SEMANTIC_RELATIONS_PRESET)[number];
 
 export interface Edge {
   from: string;
@@ -67,7 +87,32 @@ export interface IntegrityRule {
   threshold?: number;
 }
 
+// Discovered relation metadata
+export interface DiscoveredRelation {
+  relation: string;
+  category: 'code' | 'semantic';
+  source?: string;        // e.g., "设计文档.md"
+  pattern?: string;       // e.g., "需要审批"
+  added_by?: 'gid_extract' | 'gid_design' | 'gid_complete' | 'user_request';
+  description?: string;
+}
+
+// Graph meta with dynamic schema
+export interface GraphMeta {
+  version?: string;
+  domain?: string;
+  schema?: {
+    relations?: {
+      code?: string[];      // Code-level relations (preset + custom)
+      semantic?: string[];  // Semantic-level relations (dynamic)
+    };
+    discovered?: DiscoveredRelation[];  // Track where relations came from
+  };
+  [key: string]: unknown;
+}
+
 export interface Graph {
+  meta?: GraphMeta;
   nodes: Record<string, Node>;
   edges: Edge[];
   integrity_rules?: IntegrityRule[];

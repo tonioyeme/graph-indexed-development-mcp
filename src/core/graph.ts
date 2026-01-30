@@ -2,19 +2,21 @@
  * GID Graph Class for MCP Server
  */
 
-import { Graph, Node, Edge, EdgeRelation, GIDError } from './types.js';
+import { Graph, GraphMeta, Node, Edge, EdgeRelation, GIDError, DiscoveredRelation, CODE_RELATIONS, SEMANTIC_RELATIONS_PRESET } from './types.js';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Graph Class
 // ═══════════════════════════════════════════════════════════════════════════════
 
 export class GIDGraph {
+  private meta: GraphMeta;
   private nodes: Map<string, Node>;
   private edges: Edge[];
   private outgoingEdges: Map<string, Edge[]>;
   private incomingEdges: Map<string, Edge[]>;
 
   constructor(data: Graph) {
+    this.meta = data.meta ?? { version: '2.0', schema: { relations: { code: [...CODE_RELATIONS], semantic: [...SEMANTIC_RELATIONS_PRESET] } } };
     this.nodes = new Map(Object.entries(data.nodes));
     this.edges = data.edges;
 
@@ -197,6 +199,81 @@ export class GIDGraph {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // Meta & Schema Operations
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  getMeta(): GraphMeta {
+    return this.meta;
+  }
+
+  /**
+   * Get all valid relations (preset + custom)
+   */
+  getValidRelations(): { code: string[]; semantic: string[]; all: string[] } {
+    const code = [...(this.meta.schema?.relations?.code ?? [...CODE_RELATIONS])];
+    const semantic = [...(this.meta.schema?.relations?.semantic ?? [...SEMANTIC_RELATIONS_PRESET])];
+
+    // Include discovered relations
+    if (this.meta.schema?.discovered) {
+      for (const d of this.meta.schema.discovered) {
+        if (d.category === 'code' && !code.includes(d.relation)) {
+          code.push(d.relation);
+        } else if (d.category === 'semantic' && !semantic.includes(d.relation)) {
+          semantic.push(d.relation);
+        }
+      }
+    }
+
+    return { code, semantic, all: [...code, ...semantic] };
+  }
+
+  /**
+   * Add a new relation to the schema
+   */
+  addRelation(relation: string, category: 'code' | 'semantic', metadata?: Omit<DiscoveredRelation, 'relation' | 'category'>): boolean {
+    // Initialize schema structure if needed
+    if (!this.meta.schema) this.meta.schema = {};
+    if (!this.meta.schema.relations) this.meta.schema.relations = { code: [...CODE_RELATIONS], semantic: [...SEMANTIC_RELATIONS_PRESET] };
+    if (!this.meta.schema.discovered) this.meta.schema.discovered = [];
+
+    const relations = category === 'code' ? this.meta.schema.relations.code! : this.meta.schema.relations.semantic!;
+
+    // Check if already exists
+    if (relations.includes(relation)) {
+      return false; // Already exists
+    }
+
+    // Add to relations list
+    relations.push(relation);
+
+    // Track discovery metadata
+    this.meta.schema.discovered.push({
+      relation,
+      category,
+      ...metadata,
+    });
+
+    return true;
+  }
+
+  /**
+   * Check if a relation is valid
+   */
+  isValidRelation(relation: string): boolean {
+    return this.getValidRelations().all.includes(relation);
+  }
+
+  /**
+   * Get relation category
+   */
+  getRelationCategory(relation: string): 'code' | 'semantic' | 'unknown' {
+    const { code, semantic } = this.getValidRelations();
+    if (code.includes(relation)) return 'code';
+    if (semantic.includes(relation)) return 'semantic';
+    return 'unknown';
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // Utility
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -224,6 +301,7 @@ export class GIDGraph {
 
   toJSON(): Graph {
     return {
+      meta: this.meta,
       nodes: Object.fromEntries(this.nodes),
       edges: this.edges,
     };

@@ -190,11 +190,12 @@ const TOOLS = [
   },
   {
     name: 'gid_get_schema',
-    description: 'Get the GID graph schema and examples for designing graphs',
+    description: 'Get the GID graph schema with dynamic relations. If a graph exists, includes custom/discovered relations from that graph.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         includeExample: { type: 'boolean', description: 'Include example graph (default: true)' },
+        graphPath: { type: 'string', description: 'Path to graph.yml to read custom relations from (optional, auto-detects)' },
       },
     },
   },
@@ -282,7 +283,7 @@ const TOOLS = [
   },
   {
     name: 'gid_edit_graph',
-    description: 'Directly add, update, or delete nodes and edges in the graph',
+    description: 'Directly add, update, or delete nodes, edges, and relation types in the graph. Supports dynamic relation schema.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -294,7 +295,7 @@ const TOOLS = [
             properties: {
               action: {
                 type: 'string',
-                enum: ['add_node', 'update_node', 'delete_node', 'add_edge', 'delete_edge'],
+                enum: ['add_node', 'update_node', 'delete_node', 'add_edge', 'delete_edge', 'add_relation', 'remove_relation'],
                 description: 'Operation to perform',
               },
               nodeId: { type: 'string', description: 'Node ID (for node operations)' },
@@ -308,6 +309,11 @@ const TOOLS = [
                   status: { type: 'string', enum: ['draft', 'in_progress', 'active', 'deprecated'] },
                   priority: { type: 'string', enum: ['core', 'supporting', 'generic'] },
                   path: { type: 'string' },
+                  source: {
+                    type: 'array',
+                    items: { type: 'string', enum: ['code', 'docs', 'manual'] },
+                    description: 'Where this node was identified from (code extraction, documentation, or manual input)'
+                  },
                 },
               },
               edge: {
@@ -316,7 +322,20 @@ const TOOLS = [
                 properties: {
                   from: { type: 'string' },
                   to: { type: 'string' },
-                  relation: { type: 'string', enum: ['implements', 'depends_on', 'calls', 'reads', 'writes', 'tested_by', 'defined_in', 'decided_by'] },
+                  relation: {
+                    type: 'string',
+                    description: 'Relation type - can be any string (dynamic schema). Preset: implements, depends_on, calls, reads, writes, tested_by, defined_in, enables, blocks, requires, precedes, refines, validates, related_to, decided_by'
+                  },
+                },
+              },
+              // For add_relation/remove_relation
+              relation: {
+                type: 'object',
+                description: 'Relation data (for add_relation/remove_relation)',
+                properties: {
+                  name: { type: 'string', description: 'Relation name (e.g., "approves", "mentors")' },
+                  category: { type: 'string', enum: ['code', 'semantic'], description: 'Relation category' },
+                  description: { type: 'string', description: 'What this relation means' },
                 },
               },
             },
@@ -327,6 +346,18 @@ const TOOLS = [
         dryRun: { type: 'boolean', description: 'Preview changes without applying (default: false)' },
       },
       required: ['operations'],
+    },
+  },
+  {
+    name: 'gid_complete',
+    description: 'Analyze existing graph and documentation to identify gaps and suggest semantic layer additions. Returns structured context for AI to complete the graph with gid_edit_graph.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        graphPath: { type: 'string', description: 'Path to existing graph.yml' },
+        docsPath: { type: 'string', description: 'Path to documentation directory to analyze' },
+        docContent: { type: 'string', description: 'Direct documentation content to analyze (alternative to docsPath)' },
+      },
     },
   },
   {
@@ -467,31 +498,123 @@ async function handleQueryPath(args: { from: string; to: string; graphPath?: str
   };
 }
 
-async function handleDesign(args: { requirements: string; outputPath?: string }) {
-  // Parse requirements to extract potential features and components
-  const requirements = args.requirements.toLowerCase();
+// Relation patterns for extraction (supports Chinese and English)
+const RELATION_PATTERNS: Record<string, { patterns: string[]; category: 'code' | 'semantic' }> = {
+  // Code-level relations
+  implements: { patterns: ['实现', '实作', 'implements', 'implement'], category: 'code' },
+  depends_on: { patterns: ['依赖', '需要', '基于', 'depends on', 'relies on', 'based on'], category: 'code' },
+  calls: { patterns: ['调用', '调取', 'calls', 'invokes'], category: 'code' },
+  reads: { patterns: ['读取', '获取', 'reads', 'fetches'], category: 'code' },
+  writes: { patterns: ['写入', '存储', 'writes', 'stores'], category: 'code' },
+  tested_by: { patterns: ['测试', '被测试', 'tested by', 'test'], category: 'code' },
 
-  // Extract keywords to suggest structure
-  const featureKeywords = ['login', 'register', 'auth', 'payment', 'checkout', 'search', 'notification', 'upload', 'download', 'report', 'dashboard', 'profile', 'settings'];
-  const componentKeywords = ['service', 'controller', 'repository', 'api', 'database', 'cache', 'queue', 'email', 'sms', 'storage'];
+  // Semantic-level relations
+  enables: { patterns: ['完成后', '才能', '解锁', '开启', 'enables', 'unlocks', 'after'], category: 'semantic' },
+  blocks: { patterns: ['阻塞', '阻止', '挡住', 'blocks', 'prevents', 'blocked by'], category: 'semantic' },
+  requires: { patterns: ['需要', '必须', '先决条件', 'requires', 'needs', 'prerequisite'], category: 'semantic' },
+  precedes: { patterns: ['之前', '先于', '优先', 'before', 'precedes', 'prior to'], category: 'semantic' },
+  refines: { patterns: ['细化', '子任务', '分解', 'refines', 'subtask of', 'breaks down'], category: 'semantic' },
+  validates: { patterns: ['验证', '校验', '确认', 'validates', 'verifies', 'confirms'], category: 'semantic' },
+  related_to: { patterns: ['相关', '关联', '有关', 'related to', 'associated with'], category: 'semantic' },
+  decided_by: { patterns: ['决定', '由...决定', '取决于', 'decided by', 'determined by'], category: 'semantic' },
+};
+
+// Core relation types
+const CORE_RELATIONS = {
+  code: ['implements', 'depends_on', 'calls', 'reads', 'writes', 'tested_by', 'defined_in'],
+  semantic: ['enables', 'blocks', 'requires', 'precedes', 'refines', 'validates', 'related_to', 'decided_by'],
+};
+
+async function handleDesign(args: { requirements: string; outputPath?: string }) {
+  const requirements = args.requirements;
+  const requirementsLower = requirements.toLowerCase();
+
+  // === 1. Extract entity keywords ===
+  const featureKeywords = ['login', 'register', 'auth', 'payment', 'checkout', 'search', 'notification', 'upload', 'download', 'report', 'dashboard', 'profile', 'settings', '登录', '注册', '认证', '支付', '搜索', '通知', '上传', '下载', '报告', '仪表盘', '个人资料', '设置'];
+  const componentKeywords = ['service', 'controller', 'repository', 'api', 'database', 'cache', 'queue', 'email', 'sms', 'storage', '服务', '控制器', '存储库', '接口', '数据库', '缓存', '队列', '邮件', '短信'];
 
   const suggestedFeatures: string[] = [];
   const suggestedComponents: string[] = [];
 
   for (const keyword of featureKeywords) {
-    if (requirements.includes(keyword)) {
-      suggestedFeatures.push(keyword.charAt(0).toUpperCase() + keyword.slice(1));
+    if (requirementsLower.includes(keyword.toLowerCase())) {
+      const name = keyword.charAt(0).toUpperCase() + keyword.slice(1);
+      if (!suggestedFeatures.includes(name)) {
+        suggestedFeatures.push(name);
+      }
     }
   }
 
   for (const keyword of componentKeywords) {
-    if (requirements.includes(keyword)) {
-      suggestedComponents.push(keyword.charAt(0).toUpperCase() + keyword.slice(1) + 'Service');
+    if (requirementsLower.includes(keyword.toLowerCase())) {
+      const name = keyword.charAt(0).toUpperCase() + keyword.slice(1) + 'Service';
+      if (!suggestedComponents.includes(name)) {
+        suggestedComponents.push(name);
+      }
     }
   }
 
-  // Generate a template graph structure
+  // === 2. Extract relation keywords (NEW!) ===
+  const detectedRelations: Array<{
+    relation: string;
+    category: 'code' | 'semantic';
+    matchedPattern: string;
+    context: string;
+  }> = [];
+
+  for (const [relation, config] of Object.entries(RELATION_PATTERNS)) {
+    for (const pattern of config.patterns) {
+      const patternLower = pattern.toLowerCase();
+      const index = requirementsLower.indexOf(patternLower);
+      if (index !== -1) {
+        // Extract surrounding context (30 chars before and after)
+        const start = Math.max(0, index - 30);
+        const end = Math.min(requirements.length, index + pattern.length + 30);
+        const context = requirements.slice(start, end);
+
+        // Avoid duplicates
+        if (!detectedRelations.find(r => r.relation === relation)) {
+          detectedRelations.push({
+            relation,
+            category: config.category,
+            matchedPattern: pattern,
+            context: (start > 0 ? '...' : '') + context + (end < requirements.length ? '...' : ''),
+          });
+        }
+      }
+    }
+  }
+
+  // === 3. Generate template graph with dynamic schema ===
+  // Build discovered relations for meta.schema
+  const discoveredRelations = detectedRelations.map(r => ({
+    relation: r.relation,
+    category: r.category,
+    source: 'requirements',
+    pattern: r.matchedPattern,
+    added_by: 'gid_design' as const,
+  }));
+
+  // Collect unique semantic relations (preset + discovered)
+  const semanticRelations = [...CORE_RELATIONS.semantic];
+  for (const d of discoveredRelations) {
+    if (d.category === 'semantic' && !semanticRelations.includes(d.relation)) {
+      semanticRelations.push(d.relation);
+    }
+  }
+
   const graphTemplate = {
+    meta: {
+      version: '2.0',
+      domain: 'auto-generated',
+      schema: {
+        relations: {
+          code: [...CORE_RELATIONS.code],
+          semantic: semanticRelations,
+        },
+        discovered: discoveredRelations,
+      },
+    },
     nodes: {} as Record<string, object>,
     edges: [] as Array<{ from: string; to: string; relation: string }>,
   };
@@ -502,6 +625,7 @@ async function handleDesign(args: { requirements: string; outputPath?: string })
       type: 'Feature',
       description: `${feature} functionality`,
       priority: 'supporting',
+      status: 'draft',
     };
   }
 
@@ -511,10 +635,11 @@ async function handleDesign(args: { requirements: string; outputPath?: string })
       type: 'Component',
       layer: 'application',
       description: `Handles ${component.replace('Service', '').toLowerCase()} logic`,
+      status: 'draft',
     };
   }
 
-  // Generate edges (components implement features)
+  // Generate edges (basic: components implement features)
   for (const feature of suggestedFeatures) {
     for (const component of suggestedComponents) {
       if (component.toLowerCase().includes(feature.toLowerCase().slice(0, 4))) {
@@ -527,26 +652,59 @@ async function handleDesign(args: { requirements: string; outputPath?: string })
     }
   }
 
+  // === 4. Build result ===
   const result = {
     requirements: args.requirements,
-    suggestedFeatures,
-    suggestedComponents,
+    analysis: {
+      suggestedFeatures,
+      suggestedComponents,
+      detectedRelations,
+    },
+    dynamicSchema: {
+      code: graphTemplate.meta.schema.relations.code,
+      semantic: graphTemplate.meta.schema.relations.semantic,
+      discovered: discoveredRelations,
+    },
     graphTemplate,
     instructions: `
-This is a starting template based on keywords in your requirements.
-To generate a more complete graph:
+## GID Design Analysis Results
 
-1. Use gid_get_schema to understand the full graph structure
-2. Expand this template with:
-   - More specific Features based on business capabilities
-   - Components organized by layer (interface, application, domain, infrastructure)
-   - Proper edges: implements, depends_on, tested_by, etc.
-3. Use gid_init to create the graph, then gid_edit_graph to build it out
+### Detected Relations (Auto-discovered)
+${detectedRelations.length > 0
+  ? detectedRelations.map(r => `- **${r.relation}** (${r.category}): matched "${r.matchedPattern}" in "${r.context}"`).join('\n')
+  : '- No specific relation keywords detected - Claude can discover more from context'}
 
-For AI-powered graph generation, the AI assistant can:
-1. Analyze the requirements more deeply
-2. Generate a complete graph.yml structure
-3. Use gid_edit_graph to create it
+### Dynamic Schema
+Relations are now dynamic. The graph template includes:
+- **Preset code relations**: ${CORE_RELATIONS.code.join(', ')}
+- **Preset semantic relations**: ${CORE_RELATIONS.semantic.join(', ')}
+- **Discovered from requirements**: ${discoveredRelations.map(r => r.relation).join(', ') || 'none'}
+
+### Adding Custom Relations
+If you discover a domain-specific relation (e.g., "approves", "mentors"), use gid_edit_graph:
+\`\`\`json
+{
+  "operations": [{
+    "action": "add_relation",
+    "relation": "approves",
+    "category": "semantic",
+    "description": "A approves B (approval workflow)"
+  }]
+}
+\`\`\`
+
+### Next Steps
+1. **Review detected relations** - Use them when building edges
+2. **Discover more relations** - Claude can analyze the full text and extract domain-specific relations
+3. **Use gid_edit_graph** to add nodes, edges, and new relation types
+
+### Example Edge with Semantic Relation
+\`\`\`yaml
+edges:
+  - { from: PublishMCP, to: HackerNews, relation: enables }
+  - { from: Bug, to: Feature, relation: blocks }
+  - { from: IdeaSpark, to: GID, relation: depends_on }
+\`\`\`
     `.trim(),
   };
 
@@ -569,6 +727,260 @@ For AI-powered graph generation, the AI assistant can:
       ],
     };
   }
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify(result, null, 2),
+      },
+    ],
+  };
+}
+
+async function handleComplete(args: { graphPath?: string; docsPath?: string; docContent?: string }) {
+  const graphPath = args.graphPath ?? findGraphFile();
+
+  // Load existing graph
+  interface NodeData {
+    id: string;
+    type: string;
+    layer?: string;
+    source?: string[];
+    description?: string;
+    status?: string;
+  }
+  let existingNodes: NodeData[] = [];
+  let existingEdges: Array<{ from: string; to: string; relation: string }> = [];
+
+  if (graphPath) {
+    try {
+      const graphData = loadGraph(graphPath);
+      existingNodes = Object.entries(graphData.nodes || {}).map(([id, data]) => ({
+        id,
+        type: (data as Record<string, unknown>).type as string,
+        layer: (data as Record<string, unknown>).layer as string | undefined,
+        source: (data as Record<string, unknown>).source as string[] | undefined,
+        description: (data as Record<string, unknown>).description as string | undefined,
+        status: (data as Record<string, unknown>).status as string | undefined,
+      }));
+      existingEdges = (graphData.edges || []) as typeof existingEdges;
+    } catch {
+      // No existing graph
+    }
+  }
+
+  // Load documentation
+  let docText = args.docContent || '';
+  const loadedDocs: string[] = [];
+
+  if (args.docsPath) {
+    const fs = await import('fs');
+    const pathModule = await import('path');
+
+    try {
+      const stat = fs.statSync(args.docsPath);
+      if (stat.isDirectory()) {
+        const files = fs.readdirSync(args.docsPath);
+        for (const file of files) {
+          if (file.endsWith('.md') || file.endsWith('.txt')) {
+            const content = fs.readFileSync(pathModule.join(args.docsPath, file), 'utf-8');
+            docText += `\n\n=== ${file} ===\n${content}`;
+            loadedDocs.push(file);
+          }
+        }
+      } else {
+        docText = fs.readFileSync(args.docsPath, 'utf-8');
+        loadedDocs.push(pathModule.basename(args.docsPath));
+      }
+    } catch {
+      // Path doesn't exist or can't be read
+    }
+  }
+
+  // Analyze graph structure
+  const features = existingNodes.filter(n => n.type === 'Feature');
+  const components = existingNodes.filter(n => n.type === 'Component');
+  const decisions = existingNodes.filter(n => n.type === 'Decision');
+  const files = existingNodes.filter(n => n.type === 'File');
+
+  // Analyze source coverage
+  const nodesWithSource = existingNodes.filter(n => n.source && n.source.length > 0);
+  const nodesWithoutSource = existingNodes.filter(n => !n.source || n.source.length === 0);
+  const codeOnlyNodes = existingNodes.filter(n => n.source?.includes('code') && !n.source?.includes('docs'));
+  const docsOnlyNodes = existingNodes.filter(n => n.source?.includes('docs') && !n.source?.includes('code'));
+
+  // Analyze edge coverage
+  const componentFeatureEdges = existingEdges.filter(e => e.relation === 'implements');
+  const componentIds = components.map(c => c.id);
+  const linkedComponents = new Set(componentFeatureEdges.map(e => e.from));
+  const unlinkedComponents = componentIds.filter(c => !linkedComponents.has(c));
+
+  // Relation patterns for guidance
+  const relationGuidance = Object.entries(RELATION_PATTERNS).map(([relation, config]) => ({
+    relation,
+    category: config.category,
+    lookFor: config.patterns.slice(0, 3).join(', '),
+  }));
+
+  // === Discover relations from documentation ===
+  const discoveredFromDocs: Array<{
+    relation: string;
+    category: 'code' | 'semantic';
+    pattern: string;
+    context: string;
+    source: string;
+  }> = [];
+
+  if (docText) {
+    const docTextLower = docText.toLowerCase();
+    for (const [relation, config] of Object.entries(RELATION_PATTERNS)) {
+      for (const pattern of config.patterns) {
+        const patternLower = pattern.toLowerCase();
+        const index = docTextLower.indexOf(patternLower);
+        if (index !== -1) {
+          const start = Math.max(0, index - 40);
+          const end = Math.min(docText.length, index + pattern.length + 40);
+          const context = docText.slice(start, end);
+
+          if (!discoveredFromDocs.find(r => r.relation === relation)) {
+            discoveredFromDocs.push({
+              relation,
+              category: config.category,
+              pattern,
+              context: (start > 0 ? '...' : '') + context + (end < docText.length ? '...' : ''),
+              source: 'documentation',
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Build dynamic schema for the result
+  const dynamicSchema = {
+    code: CORE_RELATIONS.code,
+    semantic: [...new Set([
+      ...CORE_RELATIONS.semantic,
+      ...discoveredFromDocs.filter(r => r.category === 'semantic').map(r => r.relation),
+    ])],
+    discovered: discoveredFromDocs.map(r => ({
+      relation: r.relation,
+      category: r.category,
+      source: r.source,
+      pattern: r.pattern,
+      added_by: 'gid_complete' as const,
+    })),
+  };
+
+  const result = {
+    graphState: {
+      path: graphPath,
+      summary: {
+        totalNodes: existingNodes.length,
+        features: features.length,
+        components: components.length,
+        decisions: decisions.length,
+        files: files.length,
+        totalEdges: existingEdges.length,
+      },
+      nodes: existingNodes,
+      edges: existingEdges,
+    },
+    documentation: {
+      docsPath: args.docsPath,
+      loadedFiles: loadedDocs,
+      contentLength: docText.length,
+      content: docText.length > 10000 ? docText.slice(0, 10000) + '\n\n... (truncated)' : docText,
+    },
+    analysis: {
+      sourceCoverage: {
+        nodesWithSource: nodesWithSource.length,
+        nodesWithoutSource: nodesWithoutSource.length,
+        nodesNeedingSourceTag: nodesWithoutSource.map(n => n.id),
+      },
+      gaps: {
+        codeOnlyNodes: codeOnlyNodes.map(n => n.id),
+        docsOnlyNodes: docsOnlyNodes.map(n => n.id),
+        unlinkedComponents,
+      },
+    },
+    dynamicSchema,
+    discoveredRelations: discoveredFromDocs,
+    relationPatterns: relationGuidance,
+    instructions: `
+## Graph Completion Guide
+
+You are analyzing a graph that may need completion. Here's what to do:
+
+### 1. Review Current Graph State
+- Total nodes: ${existingNodes.length}
+- Features: ${features.length}, Components: ${components.length}
+- Nodes without source tag: ${nodesWithoutSource.length}
+- Unlinked components: ${unlinkedComponents.length}
+
+### 2. Documentation Analysis
+${loadedDocs.length > 0 ? `Loaded docs: ${loadedDocs.join(', ')}` : 'No documentation provided'}
+${discoveredFromDocs.length > 0 ? `\n**Auto-discovered relations from docs:**\n${discoveredFromDocs.map(r => `- **${r.relation}** (${r.category}): "${r.pattern}"`).join('\n')}` : ''}
+
+### 3. Dynamic Schema
+Relations are dynamic. Current schema:
+- **Code relations**: ${dynamicSchema.code.join(', ')}
+- **Semantic relations**: ${dynamicSchema.semantic.join(', ')}
+${dynamicSchema.discovered.length > 0 ? `- **Discovered**: ${dynamicSchema.discovered.map(d => d.relation).join(', ')}` : ''}
+
+**Adding custom relations:**
+If you find domain-specific relations in the docs (e.g., "approves", "escalates_to"), add them:
+\`\`\`json
+{
+  "operations": [{
+    "action": "add_relation",
+    "relation": "approves",
+    "category": "semantic",
+    "description": "A approves B"
+  }]
+}
+\`\`\`
+
+### 4. Your Tasks
+
+**A. Extract Features from Documentation**
+Read the documentation and identify business features, capabilities, or user stories.
+For each feature found, use \`gid_edit_graph\` to add:
+\`\`\`json
+{
+  "operations": [{
+    "action": "add_node",
+    "nodeId": "FeatureName",
+    "node": {
+      "type": "Feature",
+      "description": "What this feature does",
+      "status": "draft",
+      "priority": "core|supporting|generic",
+      "source": ["docs"]
+    }
+  }]
+}
+\`\`\`
+
+**B. Link Components to Features**
+${unlinkedComponents.length > 0 ? `Unlinked components: ${unlinkedComponents.join(', ')}` : 'All components are linked.'}
+
+**C. Add Semantic Relations**
+Use discovered relations and look for additional patterns:
+${relationGuidance.filter(r => r.category === 'semantic').map(r => `- **${r.relation}**: "${r.lookFor}"`).join('\n')}
+
+**D. Tag Node Sources**
+For nodes without source tags (${nodesWithoutSource.length} nodes), update them.
+
+### 5. Quality Checklist
+- [ ] All business features from docs are represented
+- [ ] Components are linked to their features via \`implements\`
+- [ ] Semantic relations captured (use discovered + look for more)
+- [ ] All nodes have source tags
+- [ ] Domain-specific relations added to schema
+    `.trim(),
+  };
 
   return {
     content: [
@@ -886,13 +1298,77 @@ async function handleHistory(args: {
   throw new McpError(ErrorCode.InvalidRequest, `Unknown action: ${action}`);
 }
 
-async function handleGetSchema(args: { includeExample?: boolean }) {
+async function handleGetSchema(args: { includeExample?: boolean; graphPath?: string }) {
   const includeExample = args.includeExample !== false;
 
+  // Try to load dynamic schema from existing graph
+  let customCodeRelations: string[] = [];
+  let customSemanticRelations: string[] = [];
+  let discoveredRelations: Array<{ relation: string; category: string; description?: string; added_by?: string }> = [];
+  let graphMeta: { path?: string } | null = null;
+
+  const graphPath = args.graphPath ?? findGraphFile();
+  if (graphPath) {
+    try {
+      const graphData = loadGraph(graphPath);
+      if (graphData.meta?.schema?.relations) {
+        // Get custom relations (those not in preset)
+        const presetCode = CORE_RELATIONS.code;
+        const presetSemantic = CORE_RELATIONS.semantic;
+
+        customCodeRelations = (graphData.meta.schema.relations.code ?? [])
+          .filter((r: string) => !presetCode.includes(r));
+        customSemanticRelations = (graphData.meta.schema.relations.semantic ?? [])
+          .filter((r: string) => !presetSemantic.includes(r));
+      }
+      if (graphData.meta?.schema?.discovered) {
+        discoveredRelations = graphData.meta.schema.discovered;
+      }
+      graphMeta = { path: graphPath };
+    } catch {
+      // No graph or invalid - use defaults
+    }
+  }
+
   const schema = {
-    description: 'GID (Graph-Indexed Development) graph schema',
+    description: 'GID (Graph-Indexed Development) graph schema v2.0 - Dynamic Relations',
+    version: '2.0',
+    graphPath: graphMeta?.path ?? null,
     nodeTypes: ['Feature', 'Component', 'Interface', 'Data', 'File', 'Test', 'Decision'],
-    edgeRelations: ['implements', 'depends_on', 'calls', 'reads', 'writes', 'tested_by', 'defined_in', 'decided_by'],
+    edgeRelations: {
+      code: {
+        description: 'Relations for code-level (Bottom-Up) extraction',
+        preset: ['implements', 'depends_on', 'calls', 'reads', 'writes', 'tested_by', 'defined_in'],
+        custom: customCodeRelations,
+        all: [...CORE_RELATIONS.code, ...customCodeRelations],
+      },
+      semantic: {
+        description: 'Relations for semantic-level (Top-Down) design - dynamic, discovered from docs',
+        preset: ['enables', 'blocks', 'requires', 'precedes', 'refines', 'validates', 'related_to', 'decided_by'],
+        custom: customSemanticRelations,
+        all: [...CORE_RELATIONS.semantic, ...customSemanticRelations],
+      },
+      discovered: discoveredRelations,
+    },
+    relationDescriptions: {
+      // Code-level
+      implements: 'A implements B (component implements feature)',
+      depends_on: 'A depends on B (import/dependency)',
+      calls: 'A calls B (function/method invocation)',
+      reads: 'A reads from B (data access)',
+      writes: 'A writes to B (data modification)',
+      tested_by: 'A is tested by B',
+      defined_in: 'A is defined in B',
+      // Semantic-level
+      enables: 'A enables B (A must complete before B can start)',
+      blocks: 'A blocks B (A prevents B from progressing)',
+      requires: 'B requires A (A is prerequisite for B)',
+      precedes: 'A precedes B (temporal ordering)',
+      refines: 'A refines B (A is a subtask/detail of B)',
+      validates: 'A validates B (A verifies B correctness)',
+      related_to: 'A is related to B (loose association)',
+      decided_by: 'A is decided by B (ADR/decision reference)',
+    },
     nodeProperties: {
       type: 'Required. One of the node types above.',
       description: 'Optional. Human-readable description.',
@@ -904,10 +1380,17 @@ async function handleGetSchema(args: { includeExample?: boolean }) {
     edgeProperties: {
       from: 'Required. Source node name.',
       to: 'Required. Target node name.',
-      relation: 'Required. One of the edge relations above.',
+      relation: 'Required. Any string - preset or custom. Use gid_edit_graph with add_relation to register new relation types.',
       coupling: 'Optional. tight or loose',
       optional: 'Optional. boolean',
     },
+    addingCustomRelations: `Use gid_edit_graph to add domain-specific relations:
+{
+  "operations": [{
+    "action": "add_relation",
+    "relation": { "name": "approves", "category": "semantic", "description": "A approves B" }
+  }]
+}`,
     layerGuidelines: {
       interface: 'UI components, API endpoints, CLI handlers',
       application: 'Business logic orchestration, use cases, services',
@@ -915,12 +1398,34 @@ async function handleGetSchema(args: { includeExample?: boolean }) {
       infrastructure: 'Database, external APIs, file system, caching',
     },
     example: includeExample ? {
+      meta: {
+        version: '2.0',
+        domain: 'project-management',
+        schema: {
+          relations: {
+            code: ['implements', 'depends_on', 'calls', 'reads', 'writes', 'tested_by', 'defined_in'],
+            semantic: ['enables', 'blocks', 'requires', 'precedes', 'refines', 'validates', 'related_to', 'decided_by', 'approves'],
+          },
+          discovered: [
+            { relation: 'approves', category: 'semantic', description: 'A approves B', added_by: 'user_request' },
+          ],
+        },
+      },
       nodes: {
+        // Semantic-level (Features)
         UserRegistration: {
           type: 'Feature',
           description: 'User can create an account',
           priority: 'core',
+          status: 'active',
         },
+        EmailVerification: {
+          type: 'Feature',
+          description: 'Verify user email',
+          priority: 'supporting',
+          status: 'draft',
+        },
+        // Code-level (Components)
         UserService: {
           type: 'Component',
           description: 'Handles user CRUD operations',
@@ -931,10 +1436,19 @@ async function handleGetSchema(args: { includeExample?: boolean }) {
           description: 'PostgreSQL database connection',
           layer: 'infrastructure',
         },
+        // Decision
+        UseJWT: {
+          type: 'Decision',
+          description: 'Use JWT for authentication',
+        },
       },
       edges: [
+        // Code-level edges
         { from: 'UserService', to: 'UserRegistration', relation: 'implements' },
         { from: 'UserService', to: 'Database', relation: 'depends_on' },
+        // Semantic-level edges
+        { from: 'UserRegistration', to: 'EmailVerification', relation: 'enables' },
+        { from: 'UserService', to: 'UseJWT', relation: 'decided_by' },
       ],
     } : undefined,
   };
@@ -1558,7 +2072,7 @@ async function handleGetFileSummary(args: { filePath: string; includeContent?: b
 }
 
 interface EditOperation {
-  action: 'add_node' | 'update_node' | 'delete_node' | 'add_edge' | 'delete_edge';
+  action: 'add_node' | 'update_node' | 'delete_node' | 'add_edge' | 'delete_edge' | 'add_relation' | 'remove_relation';
   nodeId?: string;
   node?: {
     type?: string;
@@ -1572,6 +2086,11 @@ interface EditOperation {
     from?: string;
     to?: string;
     relation?: string;
+  };
+  relation?: {
+    name?: string;
+    category?: 'code' | 'semantic';
+    description?: string;
   };
 }
 
@@ -1762,6 +2281,99 @@ async function handleEditGraph(args: {
           break;
         }
 
+        case 'add_relation': {
+          const rel = op.relation as { name?: string; category?: 'code' | 'semantic'; description?: string } | undefined;
+          if (!rel?.name || !rel?.category) {
+            results.push({ action: op.action, success: false, message: 'relation.name and relation.category required' });
+            break;
+          }
+
+          // Initialize meta.schema if needed
+          if (!graphData.meta) graphData.meta = { version: '2.0' };
+          if (!graphData.meta.schema) graphData.meta.schema = { relations: { code: [...CORE_RELATIONS.code], semantic: [...CORE_RELATIONS.semantic] } };
+          if (!graphData.meta.schema.relations) graphData.meta.schema.relations = { code: [...CORE_RELATIONS.code], semantic: [...CORE_RELATIONS.semantic] };
+          if (!graphData.meta.schema.discovered) graphData.meta.schema.discovered = [];
+
+          const relations = rel.category === 'code'
+            ? (graphData.meta.schema.relations.code ??= [])
+            : (graphData.meta.schema.relations.semantic ??= []);
+
+          // Check if already exists
+          if (relations.includes(rel.name)) {
+            results.push({ action: op.action, success: false, message: `Relation "${rel.name}" already exists in ${rel.category} relations` });
+            break;
+          }
+
+          if (!dryRun) {
+            relations.push(rel.name);
+            graphData.meta.schema.discovered.push({
+              relation: rel.name,
+              category: rel.category,
+              description: rel.description,
+              added_by: 'user_request',
+            });
+          }
+          results.push({
+            action: op.action,
+            success: true,
+            message: `Added relation "${rel.name}" to ${rel.category} relations`,
+            details: { relation: rel.name, category: rel.category, description: rel.description },
+          });
+          break;
+        }
+
+        case 'remove_relation': {
+          const rel = op.relation as { name?: string; category?: 'code' | 'semantic' } | undefined;
+          if (!rel?.name) {
+            results.push({ action: op.action, success: false, message: 'relation.name required' });
+            break;
+          }
+
+          // Check if it's a preset relation
+          const isPreset = CORE_RELATIONS.code.includes(rel.name) || CORE_RELATIONS.semantic.includes(rel.name);
+          if (isPreset) {
+            results.push({ action: op.action, success: false, message: `Cannot remove preset relation "${rel.name}"` });
+            break;
+          }
+
+          if (!graphData.meta?.schema?.relations) {
+            results.push({ action: op.action, success: false, message: `Relation "${rel.name}" not found (no custom relations defined)` });
+            break;
+          }
+
+          // Find and remove from appropriate category
+          let removed = false;
+          for (const category of ['code', 'semantic'] as const) {
+            const relations = graphData.meta.schema.relations[category];
+            if (relations) {
+              const index = relations.indexOf(rel.name);
+              if (index !== -1) {
+                if (!dryRun) {
+                  relations.splice(index, 1);
+                  // Also remove from discovered
+                  if (graphData.meta.schema.discovered) {
+                    graphData.meta.schema.discovered = graphData.meta.schema.discovered.filter(
+                      d => d.relation !== rel.name
+                    );
+                  }
+                }
+                removed = true;
+                results.push({
+                  action: op.action,
+                  success: true,
+                  message: `Removed relation "${rel.name}" from ${category} relations`,
+                });
+                break;
+              }
+            }
+          }
+
+          if (!removed) {
+            results.push({ action: op.action, success: false, message: `Relation "${rel.name}" not found` });
+          }
+          break;
+        }
+
         default:
           results.push({ action: op.action, success: false, message: `Unknown action: ${op.action}` });
       }
@@ -1941,11 +2553,23 @@ function generateStaticHTML(graphData: { nodes: Record<string, unknown>; edges: 
     .node circle { stroke: #fff; stroke-width: 2px; }
     .node text { fill: #eee; font-size: 12px; pointer-events: none; }
     .link { stroke: #0f3460; stroke-opacity: 0.6; }
+    /* Code-level relations (solid) */
     .link.implements { stroke: #4caf50; }
     .link.depends_on { stroke: #2196f3; }
     .link.calls { stroke: #ff9800; }
     .link.reads { stroke: #9c27b0; }
     .link.writes { stroke: #f44336; }
+    .link.tested_by { stroke: #00bcd4; }
+    .link.defined_in { stroke: #607d8b; }
+    /* Semantic-level relations (dashed) */
+    .link.enables { stroke: #4caf50; stroke-dasharray: 5,3; }
+    .link.blocks { stroke: #f44336; stroke-dasharray: 5,3; }
+    .link.requires { stroke: #2196f3; stroke-dasharray: 5,3; }
+    .link.precedes { stroke: #ff9800; stroke-dasharray: 3,3; }
+    .link.refines { stroke: #9c27b0; stroke-dasharray: 5,3; }
+    .link.validates { stroke: #00bcd4; stroke-dasharray: 5,3; }
+    .link.related_to { stroke: #888888; stroke-dasharray: 3,3; }
+    .link.decided_by { stroke: #795548; stroke-dasharray: 5,3; }
     .legend {
       position: fixed;
       left: 20px; bottom: 70px;
@@ -1987,18 +2611,23 @@ function generateStaticHTML(graphData: { nodes: Record<string, unknown>; edges: 
 
   <div class="legend">
     <div class="legend-section">
-      <div class="legend-title">Edge Types</div>
-      <div class="legend-item"><div class="legend-color" style="background:#4caf50"></div>implements</div>
-      <div class="legend-item"><div class="legend-color" style="background:#2196f3"></div>depends_on</div>
-      <div class="legend-item"><div class="legend-color" style="background:#ff9800"></div>calls</div>
-      <div class="legend-item"><div class="legend-color" style="background:#9c27b0"></div>reads</div>
-      <div class="legend-item"><div class="legend-color" style="background:#f44336"></div>writes</div>
-      <div class="legend-item"><svg width="20" height="3" style="margin-right:8px"><line x1="0" y1="1.5" x2="20" y2="1.5" stroke="#2196f3" stroke-width="2" stroke-dasharray="4,2"/></svg>internal (within component)</div>
+      <div class="legend-title">Code Relations (solid →)</div>
+      <div class="legend-item"><svg width="24" height="10" style="margin-right:6px"><line x1="0" y1="5" x2="16" y2="5" stroke="#4caf50" stroke-width="2"/><polygon points="16,2 22,5 16,8" fill="#4caf50"/></svg>implements</div>
+      <div class="legend-item"><svg width="24" height="10" style="margin-right:6px"><line x1="0" y1="5" x2="16" y2="5" stroke="#2196f3" stroke-width="2"/><polygon points="16,2 22,5 16,8" fill="#2196f3"/></svg>depends_on</div>
+      <div class="legend-item"><svg width="24" height="10" style="margin-right:6px"><line x1="0" y1="5" x2="16" y2="5" stroke="#ff9800" stroke-width="2"/><polygon points="16,2 22,5 16,8" fill="#ff9800"/></svg>calls</div>
+    </div>
+    <div class="legend-section">
+      <div class="legend-title">Semantic Relations (dashed →)</div>
+      <div class="legend-item"><svg width="24" height="10" style="margin-right:6px"><line x1="0" y1="5" x2="16" y2="5" stroke="#4caf50" stroke-width="2" stroke-dasharray="4,2"/><polygon points="16,2 22,5 16,8" fill="#4caf50"/></svg>enables</div>
+      <div class="legend-item"><svg width="24" height="10" style="margin-right:6px"><line x1="0" y1="5" x2="16" y2="5" stroke="#f44336" stroke-width="2" stroke-dasharray="4,2"/><polygon points="16,2 22,5 16,8" fill="#f44336"/></svg>blocks</div>
+      <div class="legend-item"><svg width="24" height="10" style="margin-right:6px"><line x1="0" y1="5" x2="16" y2="5" stroke="#2196f3" stroke-width="2" stroke-dasharray="4,2"/><polygon points="16,2 22,5 16,8" fill="#2196f3"/></svg>requires</div>
+      <div class="legend-item"><svg width="24" height="10" style="margin-right:6px"><line x1="0" y1="5" x2="16" y2="5" stroke="#795548" stroke-width="2" stroke-dasharray="4,2"/><polygon points="16,2 22,5 16,8" fill="#795548"/></svg>decided_by</div>
     </div>
     <div class="legend-section">
       <div class="legend-title">Node Types</div>
-      <div class="legend-item"><div class="legend-node" style="background:#e94560"></div>Feature</div>
-      <div class="legend-item"><div class="legend-node" style="background:#4caf50"></div>Component</div>
+      <div class="legend-item"><svg width="16" height="16" style="margin-right:8px"><polygon points="8,1 15,14 1,14" fill="#e94560"/></svg>Feature (semantic)</div>
+      <div class="legend-item"><svg width="16" height="16" style="margin-right:8px"><polygon points="8,1 15,8 8,15 1,8" fill="#795548"/></svg>Decision</div>
+      <div class="legend-item"><div class="legend-node" style="background:#4caf50"></div>Component (code)</div>
       <div class="legend-item"><div class="legend-node" style="background:#607d8b"></div>File</div>
     </div>
     <div class="legend-section">
@@ -2225,6 +2854,43 @@ function generateStaticHTML(graphData: { nodes: Record<string, unknown>; edges: 
         .attr('width', width)
         .attr('height', height);
 
+      // Define arrow markers for each relation type
+      const defs = svg.append('defs');
+      const markerColors = {
+        // Code-level
+        implements: '#4caf50',
+        depends_on: '#2196f3',
+        calls: '#ff9800',
+        reads: '#9c27b0',
+        writes: '#f44336',
+        tested_by: '#00bcd4',
+        defined_in: '#607d8b',
+        // Semantic-level
+        enables: '#4caf50',
+        blocks: '#f44336',
+        requires: '#2196f3',
+        precedes: '#ff9800',
+        refines: '#9c27b0',
+        validates: '#00bcd4',
+        related_to: '#888888',
+        decided_by: '#795548',
+        default: '#0f3460'
+      };
+
+      Object.entries(markerColors).forEach(([type, color]) => {
+        defs.append('marker')
+          .attr('id', 'arrow-' + type)
+          .attr('viewBox', '0 -5 10 10')
+          .attr('refX', 25)
+          .attr('refY', 0)
+          .attr('markerWidth', 6)
+          .attr('markerHeight', 6)
+          .attr('orient', 'auto')
+          .append('path')
+          .attr('fill', color)
+          .attr('d', 'M0,-5L10,0L0,5');
+      });
+
       zoom = d3.zoom()
         .scaleExtent([0.1, 4])
         .on('zoom', (event) => g.attr('transform', event.transform));
@@ -2247,7 +2913,8 @@ function generateStaticHTML(graphData: { nodes: Record<string, unknown>; edges: 
         .join('line')
         .attr('class', d => 'link ' + d.relation + (d.isInternal ? ' internal' : ''))
         .attr('stroke-width', d => d.isInternal ? 1 : 2)
-        .attr('stroke-dasharray', d => d.isInternal ? '3,3' : null);
+        .attr('stroke-dasharray', d => d.isInternal ? '3,3' : null)
+        .attr('marker-end', d => 'url(#arrow-' + (markerColors[d.relation] ? d.relation : 'default') + ')');
 
       const node = g.append('g')
         .selectAll('g')
@@ -2262,13 +2929,46 @@ function generateStaticHTML(graphData: { nodes: Record<string, unknown>; edges: 
           }
         });
 
-      node.append('circle')
+      // Helper function to get node shape path
+      function getNodeShape(d) {
+        const size = d.isChild ? 15 : 20;
+        if (d.type === 'Feature') {
+          // Triangle pointing up (semantic/high-level)
+          return 'M0,' + (-size) + ' L' + size + ',' + (size * 0.8) + ' L' + (-size) + ',' + (size * 0.8) + ' Z';
+        } else if (d.type === 'Decision') {
+          // Diamond shape
+          return 'M0,' + (-size) + ' L' + size + ',0 L0,' + size + ' L' + (-size) + ',0 Z';
+        }
+        return null; // Use circle for others
+      }
+
+      // Render circles for Component, File, etc.
+      node.filter(d => !['Feature', 'Decision'].includes(d.type))
+        .append('circle')
         .attr('r', d => d.isChild ? 15 : 20)
         .attr('fill', d => getNodeColor(d))
         .attr('opacity', d => getNodeOpacity(d))
         .attr('stroke', d => d.layer ? layerColors[d.layer] : (d.hasChildren ? '#fff' : null))
         .attr('stroke-width', d => d.hasChildren ? 3 : (d.layer ? 3 : 2))
         .attr('stroke-dasharray', d => d.hasChildren && !d.isExpanded ? '4,2' : null);
+
+      // Render triangles for Feature nodes (semantic level)
+      node.filter(d => d.type === 'Feature')
+        .append('path')
+        .attr('d', d => getNodeShape(d))
+        .attr('fill', d => getNodeColor(d))
+        .attr('opacity', d => getNodeOpacity(d))
+        .attr('stroke', '#fff')
+        .attr('stroke-width', 2);
+
+      // Render diamonds for Decision nodes
+      node.filter(d => d.type === 'Decision')
+        .append('path')
+        .attr('d', d => getNodeShape(d))
+        .attr('fill', d => getNodeColor(d))
+        .attr('opacity', d => getNodeOpacity(d))
+        .attr('stroke', '#fff')
+        .attr('stroke-width', 2);
 
       // Add expand indicator for expandable nodes
       node.filter(d => d.hasChildren && !d.isExpanded)
@@ -2590,47 +3290,9 @@ async function handleReadResource(uri: string) {
 // Server Setup
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Free vs Pro Tool Lists
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const FREE_TOOL_NAMES = [
-  'gid_query_impact',
-  'gid_query_deps',
-  'gid_query_common_cause',
-  'gid_query_path',
-  'gid_read',
-  'gid_get_schema',
-  'gid_history',
-];
-
-const PRO_TOOL_NAMES = [
-  'gid_init',
-  'gid_extract',
-  'gid_design',
-  'gid_analyze',
-  'gid_advise',
-  'gid_refactor',
-  'gid_semantify',
-  'gid_get_file_summary',
-  'gid_edit_graph',
-  'gid_visual',
-];
-
-function createProUpgradeMessage(toolName: string): string {
-  return JSON.stringify({
-    error: 'premium_feature',
-    tool: toolName,
-    message: `"${toolName}" is available in GID Pro MCP`,
-    upgrade_url: 'https://gid-mcp.com',
-    available_tools: FREE_TOOL_NAMES,
-    description: 'Upgrade to GID Pro for full features: extract, design, analyze, semantify, refactor, visualize',
-  }, null, 2);
-}
-
 const server = new Server(
   {
-    name: 'gid-mcp-free',
+    name: 'gid-mcp-server',
     version: '1.0.0',
   },
   {
@@ -2641,22 +3303,14 @@ const server = new Server(
   }
 );
 
-// List Tools Handler - Only return free tools
+// List Tools Handler
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  const freeTools = TOOLS.filter(tool => FREE_TOOL_NAMES.includes(tool.name));
-  return { tools: freeTools };
+  return { tools: TOOLS };
 });
 
 // Call Tool Handler
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
-
-  // Check if trying to use a Pro tool
-  if (PRO_TOOL_NAMES.includes(name)) {
-    return {
-      content: [{ type: 'text', text: createProUpgradeMessage(name) }],
-    };
-  }
 
   try {
     switch (name) {
@@ -2763,6 +3417,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           outputPath?: string;
         });
 
+      case 'gid_complete':
+        return await handleComplete(args as {
+          graphPath?: string;
+          docsPath?: string;
+          docContent?: string;
+        });
+
       default:
         throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
     }
@@ -2795,9 +3456,7 @@ async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
-  console.error('GID MCP Server (Free) running on stdio');
-  console.error(`Available tools: ${FREE_TOOL_NAMES.join(', ')}`);
-  console.error('For full features, upgrade to GID Pro: https://gid-mcp.com');
+  console.error('GID MCP Server running on stdio');
 }
 
 main().catch((err) => {
