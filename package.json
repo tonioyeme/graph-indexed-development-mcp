@@ -1,5 +1,5 @@
 {
-  "name": "@gid/mcp-server",
+  "name": "graph-indexed-development-mcp",
   "version": "1.0.0",
   "description": "GID MCP Server - Model Context Protocol server for Graph-Indexed Development",
   "type": "module",
