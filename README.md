@@ -3,9 +3,11 @@
 **Model Context Protocol server for [Graph-Indexed Development](https://zenodo.org/records/18425984)**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![npm](https://img.shields.io/npm/v/gid-mcp)](https://www.npmjs.com/package/gid-mcp)
+[![npm](https://img.shields.io/npm/v/graph-indexed-development-mcp)](https://www.npmjs.com/package/graph-indexed-development-mcp)
 
 > Give AI assistants structural awareness of your codebase. GID represents software systems as typed, directed graphs — so AI can reason about architecture, not just syntax.
+
+![GID Visualization](gid-visualization.png)
 
 ---
 
@@ -17,6 +19,14 @@ AI can generate code, but it can't answer:
 - *"What's the dependency path from Controller to Database?"*
 
 GID fills this gap by providing a **graph-based map** of your software architecture that AI assistants can query and update.
+
+**Two workflows:**
+- **Top-down:** Describe what you want to build → GID generates the architecture graph → AI implements against it
+- **Bottom-up:** Extract a graph from existing code → Use it for impact analysis, safe refactoring, and planning new changes
+
+The graph evolves with your project. Every time you add a feature or refactor, the graph updates — so AI always has the current map.
+
+**Dogfooding:** GID's own architecture is defined as a GID graph. We used GID to build GID — tracking components, querying impact before refactoring, and planning new features. See the [self-referential graph](https://github.com/tonioyeme/graph-indexed-development-principle/blob/main/examples/gid-tool-graph.yml).
 
 ---
 
@@ -137,25 +147,64 @@ You: "Show me the project health score"
 
 ## Example Conversations
 
-### Impact Analysis
-**You:** "What would be affected if I change the UserService?"
+### Top-Down: Design First, Then Build
+```
+You: "Design an e-commerce backend with auth, payments, and order tracking"
+Claude uses gid_design →
+  Created 4 features: UserAuth, Payment, OrderTracking, ProductCatalog
+  Created 8 components across 4 layers
+  Created 15 dependency edges
+  Health score: 95/100
 
-**Claude** uses `gid_query_impact` → *"Changing UserService affects 5 components across 2 features. AuthController and ProfileController depend on it directly..."*
+You: "Now implement the AuthService based on the graph"
+Claude uses gid_query_deps →
+  AuthService depends on: UserRepository, TokenManager
+  Implements: UserAuth feature
+  Layer: application
+Claude generates code that fits the architecture.
+```
 
-### Debugging Shared Failures
-**You:** "OrderService and PaymentService keep failing together. Why?"
+### Bottom-Up: Extract from Existing Code
+```
+You: "Extract the dependency graph from this project"
+Claude uses gid_extract →
+  Found 42 files, 156 dependencies
+  Grouped into 12 components across 4 layers
 
-**Claude** uses `gid_query_common_cause` → *"Both depend on DatabaseService — that's likely the root cause."*
+You: "I need to refactor UserService. What would break?"
+Claude uses gid_query_impact →
+  Direct dependents: AuthController, ProfileController, OrderService
+  Affected features: UserRegistration, OrderPayment
+  5 components impacted, 2 features at risk
 
-### Architecture from Requirements
-**You:** "Design an e-commerce backend with auth, payments, and order tracking"
+You: "Why do OrderService and PaymentService keep failing together?"
+Claude uses gid_query_common_cause →
+  Shared dependency: DatabaseService
+  Both services depend on it — that's likely the root cause.
+```
 
-**Claude** uses `gid_design` → Generates a complete graph with features, components, layers, and relationships.
+### Continuous: Keep the Graph Updated
+```
+You: "I just added a NotificationService. Update the graph."
+Claude uses gid_edit_graph →
+  Added node: NotificationService (Component, application layer)
+  Added edges: depends_on EmailClient, implements Notifications feature
 
-### Graph Visualization
-**You:** "Visualize the current project architecture"
+You: "Check the project health"
+Claude uses gid_advise →
+  Health: 87/100
+  Warning: NotificationService has no tests
+  Warning: EmailClient has 6 dependents (high coupling)
+  Suggestion: Consider splitting EmailClient into smaller modules
+```
 
-**Claude** uses `gid_visual` → Generates an interactive D3.js HTML file with color-coded nodes, health score, and search.
+### Visualization
+```
+You: "Visualize the current project architecture"
+Claude uses gid_visual → Generates an interactive D3.js HTML file
+```
+
+![GID Visualization](gid-visualization.png)
 
 ---
 
@@ -203,6 +252,7 @@ edges:
 
 ## Related
 
+- [GID Methodology](https://github.com/tonioyeme/graph-indexed-development-principle) — Specification, examples, and dogfood graph
 - [GID CLI](https://github.com/tonioyeme/graph-indexed-development-cli) — Command line interface
 - [GID Paper](https://zenodo.org/records/18425984) — Formal methodology (Zenodo)
 
