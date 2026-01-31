@@ -86,7 +86,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
   "mcpServers": {
     "gid": {
       "command": "npx",
-      "args": ["gid-mcp"]
+      "args": ["graph-indexed-development-mcp"]
     }
   }
 }
@@ -95,7 +95,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ### Claude Code
 
 ```bash
-claude mcp add gid -- npx gid-mcp
+claude mcp add gid -- npx graph-indexed-development-mcp
 ```
 
 ### Cursor / VS Code
@@ -106,7 +106,7 @@ Add to your MCP settings:
 {
   "gid": {
     "command": "npx",
-    "args": ["gid-mcp"]
+    "args": ["graph-indexed-development-mcp"]
   }
 }
 ```
