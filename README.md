@@ -244,6 +244,47 @@ edges:
 
 ---
 
+## Task Tracking
+
+Nodes can have an optional `tasks` field for inline step tracking:
+
+```yaml
+webhook-push:
+  type: Component
+  layer: infrastructure
+  status: in_progress
+  description: "Webhook push notifications HMAC-SHA256"
+  tasks:
+    - "[x] Implement HMAC signing"
+    - "[x] DM webhook events"
+    - "[ ] Run migration 011 on prod"
+    - "[ ] Add retry logic"
+```
+
+**Convention:** When all tasks are done, remove the `tasks` field and set `status: active`.
+
+### Tools
+
+| Tool | Description |
+|------|-------------|
+| `gid_tasks` | Query tasks across the graph. No args = all pending. `--node <id>` for specific node. `--done` to include completed. |
+| `gid_task_update` | Toggle task completion: `--node <id> --task "task text" --done true/false` |
+| `gid_read` | Now shows tasks inline in summary output |
+
+### Display Format
+
+```
+webhook-push [Component, infrastructure, in_progress]
+  "Webhook push notifications HMAC-SHA256"
+  Tasks: 2/4 done
+    ✅ Implement HMAC signing
+    ✅ DM webhook events
+    ☐ Run migration 011 on prod
+    ☐ Add retry logic
+```
+
+---
+
 ## Requirements
 
 - Node.js >= 20.0.0

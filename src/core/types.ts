@@ -28,6 +28,7 @@ export interface Node {
   priority?: FeaturePriority;
   layer?: ComponentLayer;
   path?: string;
+  tasks?: string[];
   [key: string]: unknown;
 }
 

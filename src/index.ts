@@ -371,6 +371,32 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'gid_tasks',
+    description: 'Query tasks across the graph. Shows nodes with pending (or all) tasks.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        graphPath: { type: 'string', description: 'Path to graph.yml (optional)' },
+        node: { type: 'string', description: 'Show tasks for a specific node' },
+        done: { type: 'boolean', description: 'Include completed tasks (default: only pending)' },
+      },
+    },
+  },
+  {
+    name: 'gid_task_update',
+    description: 'Toggle task completion on a node. Marks [ ] ↔ [x]. If all tasks become done, prompts to update status.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        graphPath: { type: 'string', description: 'Path to graph.yml (optional)' },
+        node: { type: 'string', description: 'Node ID containing the task' },
+        task: { type: 'string', description: 'Task text (without checkbox prefix) to toggle' },
+        done: { type: 'boolean', description: 'Set to true to mark done, false to mark undone' },
+      },
+      required: ['node', 'task'],
+    },
+  },
 ];
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1031,6 +1057,18 @@ async function handleRead(args: { graphPath?: string; format?: string }) {
   const validation = validator.validate(graph);
   const features = graph.getFeatures().map(([id]) => id);
 
+  // Build per-node display lines with tasks
+  const nodeLines: string[] = [];
+  for (const [nodeId, node] of Object.entries(graphData.nodes)) {
+    const tags = [node.type, node.layer, node.status].filter(Boolean).join(', ');
+    nodeLines.push(`${nodeId} [${tags}]`);
+    if (node.description) nodeLines.push(`  "${node.description}"`);
+    const tasks = (node as Record<string, unknown>).tasks as string[] | undefined;
+    if (tasks && Array.isArray(tasks) && tasks.length > 0) {
+      nodeLines.push('  ' + formatTasksDisplay(tasks).split('\n').join('\n  '));
+    }
+  }
+
   const summary: GraphSummary = {
     path: graphPath,
     stats: {
@@ -1051,7 +1089,7 @@ async function handleRead(args: { graphPath?: string; format?: string }) {
     content: [
       {
         type: 'text' as const,
-        text: JSON.stringify(summary, null, 2),
+        text: nodeLines.join('\n') + '\n\n' + JSON.stringify(summary, null, 2),
       },
     ],
   };
@@ -2139,6 +2177,7 @@ async function handleEditGraph(args: {
           if (op.node.status) newNode.status = op.node.status;
           if (op.node.priority) newNode.priority = op.node.priority;
           if (op.node.path) newNode.path = op.node.path;
+          if ((op.node as Record<string, unknown>).tasks) newNode.tasks = (op.node as Record<string, unknown>).tasks;
 
           if (!dryRun) {
             graphData.nodes[op.nodeId] = newNode as typeof graphData.nodes[string];
@@ -2169,6 +2208,7 @@ async function handleEditGraph(args: {
           if (op.node?.status) updates.status = op.node.status;
           if (op.node?.priority) updates.priority = op.node.priority;
           if (op.node?.path) updates.path = op.node.path;
+          if ((op.node as Record<string, unknown>)?.tasks) updates.tasks = (op.node as Record<string, unknown>).tasks;
 
           if (!dryRun) {
             Object.assign(graphData.nodes[op.nodeId], updates);
@@ -2406,6 +2446,193 @@ async function handleEditGraph(args: {
           message: dryRun
             ? 'Preview only. Set dryRun: false to apply changes.'
             : `Applied ${successCount} operations to the graph.`,
+        }, null, 2),
+      },
+    ],
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Task Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function parseTask(task: string): { done: boolean; text: string } {
+  const m = task.match(/^\[([xX ])\]\s*(.*)/);
+  if (m) {
+    return { done: m[1].toLowerCase() === 'x', text: m[2] };
+  }
+  return { done: false, text: task };
+}
+
+function formatTaskLine(done: boolean, text: string): string {
+  return done ? `[x] ${text}` : `[ ] ${text}`;
+}
+
+function taskSummary(tasks: string[]): { done: number; total: number; pending: string[]; completed: string[] } {
+  const parsed = tasks.map(parseTask);
+  return {
+    done: parsed.filter(t => t.done).length,
+    total: parsed.length,
+    pending: parsed.filter(t => !t.done).map(t => t.text),
+    completed: parsed.filter(t => t.done).map(t => t.text),
+  };
+}
+
+function formatTasksDisplay(tasks: string[]): string {
+  const { done, total } = taskSummary(tasks);
+  const lines = [`Tasks: ${done}/${total} done`];
+  for (const t of tasks) {
+    const p = parseTask(t);
+    lines.push(p.done ? `  ✅ ${p.text}` : `  ☐ ${p.text}`);
+  }
+  return lines.join('\n');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Task Tool Handlers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function handleTasks(args: {
+  graphPath?: string;
+  node?: string;
+  done?: boolean;
+}) {
+  const graphPath = args.graphPath ?? findGraphFile();
+  if (!graphPath) {
+    throw new McpError(ErrorCode.InvalidRequest, 'No graph.yml found');
+  }
+
+  const graphData = loadGraph(graphPath);
+  const includeDone = args.done === true;
+  const results: Array<{
+    nodeId: string;
+    type: string;
+    status?: string;
+    description?: string;
+    tasks: { done: number; total: number; items: Array<{ text: string; done: boolean }> };
+  }> = [];
+
+  const entries = args.node
+    ? [[args.node, graphData.nodes[args.node]] as const]
+    : Object.entries(graphData.nodes);
+
+  for (const [nodeId, node] of entries) {
+    if (!node) {
+      if (args.node) throw new McpError(ErrorCode.InvalidRequest, `Node "${args.node}" not found`);
+      continue;
+    }
+    const tasks = (node as Record<string, unknown>).tasks as string[] | undefined;
+    if (!tasks || !Array.isArray(tasks) || tasks.length === 0) continue;
+
+    const summary = taskSummary(tasks);
+    // Skip nodes with all tasks done unless --done
+    if (!includeDone && summary.pending.length === 0) continue;
+
+    const items = tasks.map(parseTask);
+    results.push({
+      nodeId,
+      type: node.type,
+      status: node.status,
+      description: node.description,
+      tasks: {
+        done: summary.done,
+        total: summary.total,
+        items: includeDone ? items : items.filter(i => !i.done),
+      },
+    });
+  }
+
+  // Build display text
+  const lines: string[] = [];
+  for (const r of results) {
+    lines.push(`${r.nodeId} [${r.type}${r.status ? ', ' + r.status : ''}]`);
+    if (r.description) lines.push(`  "${r.description}"`);
+    lines.push(`  Tasks: ${r.tasks.done}/${r.tasks.total} done`);
+    for (const item of r.tasks.items) {
+      lines.push(item.done ? `    ✅ ${item.text}` : `    ☐ ${item.text}`);
+    }
+    lines.push('');
+  }
+
+  if (results.length === 0) {
+    lines.push(args.node ? `No tasks found on node "${args.node}"` : 'No nodes with pending tasks');
+  }
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: lines.join('\n'),
+      },
+    ],
+  };
+}
+
+async function handleTaskUpdate(args: {
+  graphPath?: string;
+  node: string;
+  task: string;
+  done?: boolean;
+}) {
+  const graphPath = args.graphPath ?? findGraphFile();
+  if (!graphPath) {
+    throw new McpError(ErrorCode.InvalidRequest, 'No graph.yml found');
+  }
+
+  const graphData = loadGraph(graphPath);
+  const node = graphData.nodes[args.node];
+  if (!node) {
+    throw new McpError(ErrorCode.InvalidRequest, `Node "${args.node}" not found`);
+  }
+
+  const tasks = (node as Record<string, unknown>).tasks as string[] | undefined;
+  if (!tasks || !Array.isArray(tasks)) {
+    throw new McpError(ErrorCode.InvalidRequest, `Node "${args.node}" has no tasks`);
+  }
+
+  // Find matching task by text (fuzzy: ignore checkbox prefix)
+  const taskTextLower = args.task.toLowerCase();
+  const idx = tasks.findIndex(t => {
+    const p = parseTask(t);
+    return p.text.toLowerCase() === taskTextLower || p.text.toLowerCase().includes(taskTextLower);
+  });
+
+  if (idx === -1) {
+    throw new McpError(ErrorCode.InvalidRequest, `Task not found: "${args.task}". Available tasks: ${tasks.map(t => parseTask(t).text).join(', ')}`);
+  }
+
+  const parsed = parseTask(tasks[idx]);
+  const newDone = args.done !== undefined ? args.done : !parsed.done;
+  tasks[idx] = formatTaskLine(newDone, parsed.text);
+
+  // Check if all tasks are now done
+  const summary = taskSummary(tasks);
+  let allDone = summary.pending.length === 0;
+  let statusUpdate: string | null = null;
+
+  if (allDone && node.status && node.status !== 'active') {
+    statusUpdate = `All tasks done! Consider removing tasks field and setting status to "active" (currently "${node.status}")`;
+  }
+
+  // Save
+  saveGraph(graphData, graphPath);
+
+  // Save to history
+  const gidDir = path.dirname(graphPath);
+  const stateManager = createStateManager(gidDir);
+  stateManager.saveHistory(graphData);
+
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({
+          node: args.node,
+          task: parsed.text,
+          done: newDone,
+          progress: `${summary.done}/${summary.total}`,
+          allDone,
+          statusUpdate,
         }, null, 2),
       },
     ],
@@ -3422,6 +3649,21 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           graphPath?: string;
           docsPath?: string;
           docContent?: string;
+        });
+
+      case 'gid_tasks':
+        return await handleTasks(args as {
+          graphPath?: string;
+          node?: string;
+          done?: boolean;
+        });
+
+      case 'gid_task_update':
+        return await handleTaskUpdate(args as {
+          graphPath?: string;
+          node: string;
+          task: string;
+          done?: boolean;
         });
 
       default:
